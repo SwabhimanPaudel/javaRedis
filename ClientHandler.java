@@ -7,34 +7,28 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.List;
+import java.util.concurrent.Semaphore;
 
 /**
- * ClientHandler - Handles the lifecycle of a single client connection
- * 
- * Each client connection is handled by a separate thread. This class reads
- * commands from the client, executes them via CommandExecutor, and sends
- * responses back to the client.
- * 
- * @author Senior Java Systems Engineer
- * @version 1.0
+ * Handles the lifecycle of a single client connection.
+ * Each connection runs in its own thread with configured timeouts.
  */
 public class ClientHandler implements Runnable {
 
+    private static final int SOCKET_TIMEOUT_MS = 30000; // 30 seconds
+
     private final Socket socket;
     private final CommandExecutor commandExecutor;
+    private final Semaphore connectionLimiter;
     private BufferedReader reader;
     private PrintWriter writer;
 
-    /**
-     * Constructs a new ClientHandler for the given socket
-     * 
-     * @param socket          The client socket
-     * @param commandExecutor The command executor to use
-     */
-    public ClientHandler(Socket socket, CommandExecutor commandExecutor) {
+    public ClientHandler(Socket socket, CommandExecutor commandExecutor, Semaphore connectionLimiter) {
         this.socket = socket;
         this.commandExecutor = commandExecutor;
+        this.connectionLimiter = connectionLimiter;
     }
 
     @Override
@@ -45,19 +39,28 @@ public class ClientHandler implements Runnable {
         try {
             initializeStreams();
             processCommands();
+        } catch (SocketTimeoutException e) {
+            System.out.println("Client timeout: " + clientAddress);
         } catch (IOException e) {
-            System.err.println("Error: " + e.getMessage());
+            if (!socket.isClosed()) {
+                System.err.println("Connection error: " + e.getMessage());
+            }
         } finally {
             cleanup();
+            connectionLimiter.release(); // Release connection permit
             System.out.println("Client disconnected: " + clientAddress);
         }
     }
 
     /**
-     * Initialize input and output streams
-     * CRITICAL: Uses BufferedReader, NOT Scanner (Scanner breaks RESP protocol)
+     * Initialize streams with socket timeouts and TCP optimizations.
      */
     private void initializeStreams() throws IOException {
+        // Configure socket for production use
+        socket.setSoTimeout(SOCKET_TIMEOUT_MS); // Read timeout
+        socket.setTcpNoDelay(true); // Disable Nagle's algorithm for low latency
+        socket.setKeepAlive(true); // Enable TCP keepalive
+
         InputStream inputStream = socket.getInputStream();
         OutputStream outputStream = socket.getOutputStream();
 
@@ -66,53 +69,37 @@ public class ClientHandler implements Runnable {
     }
 
     /**
-     * Process commands in a loop until the client disconnects
+     * Process commands in a loop until client disconnects.
      */
     private void processCommands() throws IOException {
         while (!socket.isClosed()) {
             try {
-                // Parse the incoming RESP command
                 List<String> command = RespParser.parse(reader);
 
                 if (command == null || command.isEmpty()) {
-                    // Client closed connection
-                    break;
+                    break; // Client closed connection
                 }
 
-                // Execute the command and get the response
                 String response = commandExecutor.execute(command);
-
-                // Send response back to client
                 sendResponse(response);
 
             } catch (IllegalArgumentException e) {
-                // Protocol error
                 sendResponse(RespBuilder.buildError("ERR " + e.getMessage()));
             }
         }
     }
 
-    /**
-     * Send a response to the client
-     * 
-     * @param response The RESP-formatted response
-     */
     private void sendResponse(String response) {
         writer.print(response);
         writer.flush();
     }
 
-    /**
-     * Get the client address for logging
-     * 
-     * @return The client address as a string
-     */
     private String getClientAddress() {
         return socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
     }
 
     /**
-     * Clean up resources
+     * Clean up all resources.
      */
     private void cleanup() {
         closeQuietly(reader);
@@ -120,11 +107,6 @@ public class ClientHandler implements Runnable {
         closeQuietly(socket);
     }
 
-    /**
-     * Close a Closeable resource without throwing exceptions
-     * 
-     * @param closeable The resource to close
-     */
     private void closeQuietly(Closeable closeable) {
         if (closeable != null) {
             try {
@@ -135,11 +117,6 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /**
-     * Close a socket without throwing exceptions
-     * 
-     * @param socket The socket to close
-     */
     private void closeQuietly(Socket socket) {
         if (socket != null && !socket.isClosed()) {
             try {
